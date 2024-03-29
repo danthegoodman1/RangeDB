@@ -1,11 +1,10 @@
 package utils
 
 import (
-	"context"
-	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"os"
 	"reflect"
@@ -16,17 +15,10 @@ import (
 
 	"github.com/jackc/pgtype"
 
-	"github.com/cockroachdb/cockroach-go/v2/crdb/crdbpgxv5"
-	"github.com/danthegoodman1/GoAPITemplate/gologger"
+	"github.com/danthegoodman1/RangeDB/gologger"
 	"github.com/labstack/echo/v4"
 	gonanoid "github.com/matoous/go-nanoid/v2"
-	"github.com/rs/zerolog"
 	"github.com/segmentio/ksuid"
-
-	"github.com/UltimateTournament/backoff/v4"
-	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgconn"
-	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 var logger = gologger.NewLogger()
@@ -63,43 +55,6 @@ func GenKSortedID(prefix string) string {
 	return prefix + ksuid.New().String()
 }
 
-// Cannot use to set something to "", must manually use sq.NullString for that
-func SQLNullString(s string) sql.NullString {
-	return sql.NullString{
-		String: s,
-		Valid:  s != "",
-	}
-}
-
-func SQLNullStringP(s *string) sql.NullString {
-	return sql.NullString{
-		String: Deref(s, ""),
-		Valid:  s != nil,
-	}
-}
-
-func SQLNullInt64P(s *int64) sql.NullInt64 {
-	return sql.NullInt64{
-		Int64: Deref(s, 0),
-		Valid: s != nil,
-	}
-}
-
-func SQLNullBoolP(s *bool) sql.NullBool {
-	return sql.NullBool{
-		Bool:  Deref(s, false),
-		Valid: s != nil,
-	}
-}
-
-// Cannot use to set something to 0, must manually use sq.NullInt64 for that
-func SQLNullInt64(s int64) sql.NullInt64 {
-	return sql.NullInt64{
-		Int64: s,
-		Valid: true,
-	}
-}
-
 func GenRandomShortID() string {
 	// reduced character set that's less probable to mis-type
 	// change for conflicts is still only 1:128 trillion
@@ -112,89 +67,6 @@ func DaysUntil(t time.Time, d time.Weekday) int {
 		delta += 7
 	}
 	return int(delta)
-}
-
-// this wrapper exists so caller stack skipping works
-func ReliableExec(ctx context.Context, pool *pgxpool.Pool, tryTimeout time.Duration, f func(ctx context.Context, conn *pgxpool.Conn) error) error {
-	return reliableExec(ctx, pool, tryTimeout, func(ctx context.Context, tx *pgxpool.Conn) error {
-		return f(ctx, tx)
-	})
-}
-
-func ReliableExecInTx(ctx context.Context, pool *pgxpool.Pool, tryTimeout time.Duration, f func(ctx context.Context, conn pgx.Tx) error) error {
-	return reliableExec(ctx, pool, tryTimeout, func(ctx context.Context, tx *pgxpool.Conn) error {
-		return crdbpgx.ExecuteTx(ctx, tx, pgx.TxOptions{}, func(tx pgx.Tx) error {
-			return f(ctx, tx)
-		})
-	})
-}
-
-func reliableExec(ctx context.Context, pool *pgxpool.Pool, tryTimeout time.Duration, f func(ctx context.Context, conn *pgxpool.Conn) error) error {
-	cfg := backoff.WithMaxRetries(backoff.NewExponentialBackOff(), 3)
-
-	return backoff.RetryNotify(func() error {
-		conn, err := pool.Acquire(ctx)
-		if err != nil {
-			if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
-				return backoff.Permanent(err)
-			}
-			return err
-		}
-		defer conn.Release()
-		tryCtx, cancel := context.WithTimeout(ctx, tryTimeout)
-		defer cancel()
-		err = f(tryCtx, conn)
-		if errors.Is(err, pgx.ErrNoRows) {
-			return backoff.Permanent(err)
-		}
-		if IsPermSQLErr(err) {
-			return backoff.Permanent(err)
-		}
-		// not context.DeadlineExceeded as that's expected due to `tryTimeout`
-		if errors.Is(err, context.Canceled) {
-			return backoff.Permanent(err)
-		}
-		return err
-	}, cfg, func(err error, d time.Duration) {
-		reqID, _ := ctx.Value(gologger.ReqIDKey).(string)
-		l := zerolog.Ctx(ctx).Info().Err(err).CallerSkipFrame(5)
-		if reqID != "" {
-			l.Str(string(gologger.ReqIDKey), reqID)
-		}
-		l.Msg("ReliableExec retrying")
-	})
-}
-
-func IsPermSQLErr(err error) bool {
-	if err == nil {
-		return false
-	}
-	var pgErr *pgconn.PgError
-	if errors.As(err, &pgErr) {
-		if pgErr.Code == "23505" {
-			// This is a duplicate key - unique constraint
-			return true
-		}
-		if pgErr.Code == "42703" {
-			// Column does not exist
-			return true
-		}
-	}
-	return false
-}
-
-func IsUniqueConstraint(err error) bool {
-	if err == nil {
-		return false
-	}
-	var pgErr *pgconn.PgError
-	if errors.As(err, &pgErr) {
-		if pgErr.Code == "23505" {
-			// This is a duplicate key - unique constraint
-			return true
-		}
-	}
-	return false
 }
 
 func Ptr[T any](s T) *T {
@@ -314,4 +186,18 @@ func AsErr[T error](err error) (te T, ok bool) {
 func IsErr[T error](err error) bool {
 	_, ok := AsErr[T](err)
 	return ok
+}
+
+// MustEnvOrDefaultInt64 will get an env var as an int, exiting if conversion fails
+func MustEnvOrDefaultInt64(env string, defaultVal int64) int64 {
+	res := os.Getenv(env)
+	if res == "" {
+		return defaultVal
+	}
+	// Try to convert to int
+	intVar, err := strconv.Atoi(res)
+	if err != nil {
+		log.Fatalf("failed to convert env var %s to an int", env)
+	}
+	return int64(intVar)
 }

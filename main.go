@@ -4,7 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/danthegoodman1/GoAPITemplate/observability"
+	"github.com/danthegoodman1/RangeDB/observability"
 	"github.com/joho/godotenv"
 	"net/http"
 	"os"
@@ -12,9 +12,9 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/danthegoodman1/GoAPITemplate/gologger"
-	"github.com/danthegoodman1/GoAPITemplate/http_server"
-	"github.com/danthegoodman1/GoAPITemplate/utils"
+	"github.com/danthegoodman1/RangeDB/gologger"
+	"github.com/danthegoodman1/RangeDB/http_server"
+	"github.com/danthegoodman1/RangeDB/utils"
 )
 
 var logger = gologger.NewLogger()
